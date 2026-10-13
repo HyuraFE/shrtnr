@@ -272,10 +272,17 @@ document.addEventListener('DOMContentLoaded', () => {
         body: JSON.stringify(body)
       });
 
-      const data = await res.json();
+      let data = {};
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        data = await res.json().catch(() => ({}));
+      } else {
+        const text = await res.text().catch(() => '');
+        data = { error: text || `Server error (${res.status})` };
+      }
 
       if (!res.ok) {
-        showError(data.error || 'Failed to shorten URL');
+        showError(data.error || `Failed to shorten URL (Status ${res.status})`);
       } else {
         displayResult(data.shortUrl, data.originalUrl);
         urlInput.value = '';
@@ -284,7 +291,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (err) {
       console.error('Shorten error:', err);
-      showError('Network error. Please try again.');
+      showError(err.message || 'Network error. Please try again.');
     } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = 'Shorten';

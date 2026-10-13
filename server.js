@@ -11,17 +11,47 @@ const generateShortCode = customAlphabet(ALPHABET, 7);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Turso (libSQL) database
-// If TURSO_DATABASE_URL is not provided, defaults to local file:database.db
-const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || 'file:database.db',
-  authToken: process.env.TURSO_AUTH_TOKEN
-});
+// Setup Turso / libSQL Client
+let tursoUrl = process.env.TURSO_DATABASE_URL;
+let tursoToken = process.env.TURSO_AUTH_TOKEN;
+
+// In Vercel serverless environment, local filesystem is read-only.
+// If Turso env vars are missing on Vercel, we must not fallback to file:database.db.
+const isVercel = Boolean(process.env.VERCEL);
+
+let db = null;
+let dbConfigError = null;
+
+if (!tursoUrl && isVercel) {
+  dbConfigError = 'Missing TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Vercel Environment Variables. Please add them in project settings and redeploy.';
+} else {
+  try {
+    // Normalize URL if protocol is missing
+    let normalizedUrl = tursoUrl || 'file:database.db';
+    if (tursoUrl && !/^https?:\/\/|^libsql:\/\//i.test(normalizedUrl)) {
+      normalizedUrl = `libsql://${normalizedUrl}`;
+    }
+
+    db = createClient({
+      url: normalizedUrl,
+      authToken: tursoToken
+    });
+  } catch (err) {
+    dbConfigError = `Failed to initialize database client: ${err.message}`;
+  }
+}
 
 // Ensure database table exists
 let dbInitialized = false;
 async function ensureDb() {
+  if (dbConfigError) {
+    throw new Error(dbConfigError);
+  }
+  if (!db) {
+    throw new Error('Database client is not available.');
+  }
   if (dbInitialized) return;
+
   await db.execute(`
     CREATE TABLE IF NOT EXISTS urls (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,11 +63,6 @@ async function ensureDb() {
   `);
   dbInitialized = true;
 }
-
-// Auto-run ensureDb
-ensureDb().catch(err => {
-  console.error('Failed to initialize database table:', err);
-});
 
 // Middleware
 app.use(express.json());
@@ -56,7 +81,6 @@ function normalizeUrl(inputUrl) {
   let trimmed = inputUrl.trim();
   if (!trimmed) return null;
 
-  // Add https protocol if missing
   if (!/^https?:\/\//i.test(trimmed)) {
     trimmed = 'https://' + trimmed;
   }
@@ -74,61 +98,62 @@ function normalizeUrl(inputUrl) {
 
 // POST /api/shorten
 app.post('/api/shorten', async (req, res) => {
-  await ensureDb();
-  const { url, customCode } = req.body || {};
-  const validUrl = normalizeUrl(url);
+  try {
+    await ensureDb();
 
-  if (!validUrl) {
-    return res.status(400).json({ error: 'Please enter a valid URL' });
-  }
+    const { url, customCode } = req.body || {};
+    const validUrl = normalizeUrl(url);
 
-  let shortCode;
-
-  if (customCode && customCode.trim()) {
-    // Validate custom alias
-    shortCode = customCode.trim().toLowerCase();
-
-    if (shortCode.length < 3 || shortCode.length > 30) {
-      return res.status(400).json({ error: 'Custom alias must be 3–30 characters' });
+    if (!validUrl) {
+      return res.status(400).json({ error: 'Please enter a valid URL' });
     }
 
-    if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(shortCode) && shortCode.length > 2) {
-      return res.status(400).json({ error: 'Only lowercase letters, numbers, and hyphens allowed (cannot start or end with hyphen)' });
-    }
+    let shortCode;
 
-    // Reserved words
-    const reserved = ['api', 'admin', 'static', 'public', 'favicon.ico', 'robots.txt'];
-    if (reserved.includes(shortCode)) {
-      return res.status(400).json({ error: 'This alias is reserved, please choose another' });
-    }
+    if (customCode && customCode.trim()) {
+      // Validate custom alias
+      shortCode = customCode.trim().toLowerCase();
 
-    // Check uniqueness
-    const existing = await db.execute({
-      sql: 'SELECT id FROM urls WHERE short_code = ?',
-      args: [shortCode]
-    });
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'This alias is already taken, please choose another' });
-    }
-  } else {
-    // Auto-generate short code
-    let attempts = 0;
-    while (attempts < 5) {
-      shortCode = generateShortCode();
+      if (shortCode.length < 3 || shortCode.length > 30) {
+        return res.status(400).json({ error: 'Custom alias must be 3–30 characters' });
+      }
+
+      if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(shortCode) && shortCode.length > 2) {
+        return res.status(400).json({ error: 'Only lowercase letters, numbers, and hyphens allowed (cannot start or end with hyphen)' });
+      }
+
+      // Reserved words
+      const reserved = ['api', 'admin', 'static', 'public', 'favicon.ico', 'robots.txt'];
+      if (reserved.includes(shortCode)) {
+        return res.status(400).json({ error: 'This alias is reserved, please choose another' });
+      }
+
+      // Check uniqueness
       const existing = await db.execute({
         sql: 'SELECT id FROM urls WHERE short_code = ?',
         args: [shortCode]
       });
-      if (existing.rows.length === 0) break;
-      attempts++;
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ error: 'This alias is already taken, please choose another' });
+      }
+    } else {
+      // Auto-generate short code
+      let attempts = 0;
+      while (attempts < 5) {
+        shortCode = generateShortCode();
+        const existing = await db.execute({
+          sql: 'SELECT id FROM urls WHERE short_code = ?',
+          args: [shortCode]
+        });
+        if (existing.rows.length === 0) break;
+        attempts++;
+      }
+
+      if (attempts >= 5) {
+        return res.status(500).json({ error: 'Could not generate unique short code, please try again' });
+      }
     }
 
-    if (attempts >= 5) {
-      return res.status(500).json({ error: 'Could not generate unique short code, please try again' });
-    }
-  }
-
-  try {
     await db.execute({
       sql: 'INSERT INTO urls (original_url, short_code) VALUES (?, ?)',
       args: [validUrl, shortCode]
@@ -143,15 +168,18 @@ app.post('/api/shorten', async (req, res) => {
       originalUrl: validUrl
     });
   } catch (err) {
-    console.error('Error inserting URL:', err);
-    return res.status(500).json({ error: 'Database error occurred' });
+    console.error('Error in /api/shorten:', err);
+    return res.status(500).json({ 
+      error: err.message || 'Database error occurred' 
+    });
   }
 });
 
 // GET /api/urls - list all URLs ordered by created_at DESC
 app.get('/api/urls', async (req, res) => {
-  await ensureDb();
   try {
+    await ensureDb();
+
     const result = await db.execute(`
       SELECT id, original_url, short_code, created_at, clicks
       FROM urls
@@ -170,17 +198,20 @@ app.get('/api/urls', async (req, res) => {
 
     return res.json(urls);
   } catch (err) {
-    console.error('Error retrieving URLs:', err);
-    return res.status(500).json({ error: 'Failed to retrieve URLs' });
+    console.error('Error in /api/urls:', err);
+    return res.status(500).json({ 
+      error: err.message || 'Failed to retrieve URLs' 
+    });
   }
 });
 
 // GET /api/stats/:code - stats for a specific short code
 app.get('/api/stats/:code', async (req, res) => {
-  await ensureDb();
   const { code } = req.params;
 
   try {
+    await ensureDb();
+
     const result = await db.execute({
       sql: `
         SELECT id, original_url, short_code, created_at, clicks
@@ -204,17 +235,20 @@ app.get('/api/stats/:code', async (req, res) => {
       short_url: `${baseUrl}/${row.short_code}`
     });
   } catch (err) {
-    console.error('Error fetching stats:', err);
-    return res.status(500).json({ error: 'Failed to fetch statistics' });
+    console.error('Error in /api/stats:', err);
+    return res.status(500).json({ 
+      error: err.message || 'Failed to fetch statistics' 
+    });
   }
 });
 
 // DELETE /api/urls/:code - delete a shortened URL
 app.delete('/api/urls/:code', async (req, res) => {
-  await ensureDb();
   const { code } = req.params;
 
   try {
+    await ensureDb();
+
     const result = await db.execute({
       sql: 'DELETE FROM urls WHERE short_code = ?',
       args: [code]
@@ -226,8 +260,10 @@ app.delete('/api/urls/:code', async (req, res) => {
 
     return res.json({ success: true, message: 'URL deleted successfully' });
   } catch (err) {
-    console.error('Error deleting URL:', err);
-    return res.status(500).json({ error: 'Failed to delete URL' });
+    console.error('Error in /api/urls delete:', err);
+    return res.status(500).json({ 
+      error: err.message || 'Failed to delete URL' 
+    });
   }
 });
 
@@ -240,8 +276,9 @@ app.get('/:code', async (req, res) => {
     return res.status(404).end();
   }
 
-  await ensureDb();
   try {
+    await ensureDb();
+
     const result = await db.execute({
       sql: 'SELECT original_url FROM urls WHERE short_code = ?',
       args: [code]
@@ -267,8 +304,8 @@ app.get('/:code', async (req, res) => {
   }
 });
 
-// Start server if not imported by Vercel serverless environment
-if (require.main === module || !process.env.VERCEL) {
+// Start server if run locally directly
+if (require.main === module && !process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
   });
