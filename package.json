@@ -1,0 +1,15 @@
+{
+  "name": "urlshortener",
+  "version": "1.0.0",
+  "description": "Minimalist URL Shortener",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "express": "^4.22.3",
+    "nanoid": "^3.3.20"
+  }
+}

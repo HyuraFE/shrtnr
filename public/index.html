@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>shrtnr — url shortener</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">shrtnr</div>
+    </header>
+
+    <main class="main">
+      <div id="notice-banner" class="notice-banner hidden" role="status"></div>
+
+      <section class="shorten-section">
+        <form id="shorten-form" class="shorten-form" novalidate>
+          <div class="input-group">
+            <input 
+              type="text" 
+              id="url-input" 
+              class="url-input" 
+              placeholder="Paste your long URL here..." 
+              autocomplete="off" 
+              spellcheck="false" 
+              required
+            />
+          </div>
+          <div class="alias-group">
+            <span class="alias-prefix" id="alias-prefix">localhost:3000/</span>
+            <input 
+              type="text" 
+              id="alias-input" 
+              class="alias-input" 
+              placeholder="custom-alias (optional)"
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="30"
+            />
+          </div>
+          <button type="submit" id="submit-btn" class="btn-primary">Shorten</button>
+          <div id="form-error" class="form-error hidden" role="alert"></div>
+        </form>
+
+        <div id="result-box" class="result-box hidden">
+          <div class="result-meta">
+            <span class="result-tag">Short link ready</span>
+            <a id="result-url" class="result-url" href="#" target="_blank" rel="noopener noreferrer"></a>
+            <span id="result-original" class="result-original"></span>
+          </div>
+          <div class="result-action">
+            <button type="button" id="copy-btn" class="btn-outline">Copy</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="history-section">
+        <div class="history-header">
+          <h2 class="history-title">History</h2>
+          <span id="history-count" class="history-count"></span>
+        </div>
+
+        <div id="history-empty" class="history-empty hidden">
+          No shortened links yet
+        </div>
+
+        <div id="history-list" class="history-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>URL Shortener &copy; <span id="current-year"></span></p>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
