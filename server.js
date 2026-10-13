@@ -1,6 +1,7 @@
+require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const Database = require('better-sqlite3');
+const { createClient } = require('@libsql/client');
 const { customAlphabet } = require('nanoid');
 
 // Nanoid with lowercase + digits, omitting ambiguous characters (l, 1, 0, o)
@@ -10,20 +11,33 @@ const generateShortCode = customAlphabet(ALPHABET, 7);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize SQLite database
-const dbPath = path.join(__dirname, 'database.db');
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
+// Initialize Turso (libSQL) database
+// If TURSO_DATABASE_URL is not provided, defaults to local file:database.db
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:database.db',
+  authToken: process.env.TURSO_AUTH_TOKEN
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS urls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    original_url TEXT NOT NULL,
-    short_code TEXT NOT NULL UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    clicks INTEGER DEFAULT 0
-  )
-`);
+// Ensure database table exists
+let dbInitialized = false;
+async function ensureDb() {
+  if (dbInitialized) return;
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS urls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_url TEXT NOT NULL,
+      short_code TEXT NOT NULL UNIQUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      clicks INTEGER DEFAULT 0
+    )
+  `);
+  dbInitialized = true;
+}
+
+// Auto-run ensureDb
+ensureDb().catch(err => {
+  console.error('Failed to initialize database table:', err);
+});
 
 // Middleware
 app.use(express.json());
@@ -59,7 +73,8 @@ function normalizeUrl(inputUrl) {
 }
 
 // POST /api/shorten
-app.post('/api/shorten', (req, res) => {
+app.post('/api/shorten', async (req, res) => {
+  await ensureDb();
   const { url, customCode } = req.body || {};
   const validUrl = normalizeUrl(url);
 
@@ -68,7 +83,6 @@ app.post('/api/shorten', (req, res) => {
   }
 
   let shortCode;
-  const checkStmt = db.prepare('SELECT id FROM urls WHERE short_code = ?');
 
   if (customCode && customCode.trim()) {
     // Validate custom alias
@@ -89,7 +103,11 @@ app.post('/api/shorten', (req, res) => {
     }
 
     // Check uniqueness
-    if (checkStmt.get(shortCode)) {
+    const existing = await db.execute({
+      sql: 'SELECT id FROM urls WHERE short_code = ?',
+      args: [shortCode]
+    });
+    if (existing.rows.length > 0) {
       return res.status(409).json({ error: 'This alias is already taken, please choose another' });
     }
   } else {
@@ -97,7 +115,11 @@ app.post('/api/shorten', (req, res) => {
     let attempts = 0;
     while (attempts < 5) {
       shortCode = generateShortCode();
-      if (!checkStmt.get(shortCode)) break;
+      const existing = await db.execute({
+        sql: 'SELECT id FROM urls WHERE short_code = ?',
+        args: [shortCode]
+      });
+      if (existing.rows.length === 0) break;
       attempts++;
     }
 
@@ -107,8 +129,10 @@ app.post('/api/shorten', (req, res) => {
   }
 
   try {
-    const insertStmt = db.prepare('INSERT INTO urls (original_url, short_code) VALUES (?, ?)');
-    insertStmt.run(validUrl, shortCode);
+    await db.execute({
+      sql: 'INSERT INTO urls (original_url, short_code) VALUES (?, ?)',
+      args: [validUrl, shortCode]
+    });
 
     const baseUrl = getBaseUrl(req);
     const shortUrl = `${baseUrl}/${shortCode}`;
@@ -125,16 +149,17 @@ app.post('/api/shorten', (req, res) => {
 });
 
 // GET /api/urls - list all URLs ordered by created_at DESC
-app.get('/api/urls', (req, res) => {
+app.get('/api/urls', async (req, res) => {
+  await ensureDb();
   try {
-    const rows = db.prepare(`
+    const result = await db.execute(`
       SELECT id, original_url, short_code, created_at, clicks
       FROM urls
       ORDER BY created_at DESC, id DESC
-    `).all();
+    `);
 
     const baseUrl = getBaseUrl(req);
-    const urls = rows.map(item => ({
+    const urls = result.rows.map(item => ({
       id: item.id,
       original_url: item.original_url,
       short_code: item.short_code,
@@ -151,20 +176,25 @@ app.get('/api/urls', (req, res) => {
 });
 
 // GET /api/stats/:code - stats for a specific short code
-app.get('/api/stats/:code', (req, res) => {
+app.get('/api/stats/:code', async (req, res) => {
+  await ensureDb();
   const { code } = req.params;
 
   try {
-    const row = db.prepare(`
-      SELECT id, original_url, short_code, created_at, clicks
-      FROM urls
-      WHERE short_code = ?
-    `).get(code);
+    const result = await db.execute({
+      sql: `
+        SELECT id, original_url, short_code, created_at, clicks
+        FROM urls
+        WHERE short_code = ?
+      `,
+      args: [code]
+    });
 
-    if (!row) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Short URL not found' });
     }
 
+    const row = result.rows[0];
     const baseUrl = getBaseUrl(req);
     return res.json({
       original_url: row.original_url,
@@ -180,14 +210,17 @@ app.get('/api/stats/:code', (req, res) => {
 });
 
 // DELETE /api/urls/:code - delete a shortened URL
-app.delete('/api/urls/:code', (req, res) => {
+app.delete('/api/urls/:code', async (req, res) => {
+  await ensureDb();
   const { code } = req.params;
 
   try {
-    const deleteStmt = db.prepare('DELETE FROM urls WHERE short_code = ?');
-    const result = deleteStmt.run(code);
+    const result = await db.execute({
+      sql: 'DELETE FROM urls WHERE short_code = ?',
+      args: [code]
+    });
 
-    if (result.changes === 0) {
+    if (result.rowsAffected === 0) {
       return res.status(404).json({ error: 'Short URL not found' });
     }
 
@@ -199,7 +232,7 @@ app.delete('/api/urls/:code', (req, res) => {
 });
 
 // GET /:code - Redirect to original URL, or back to / with error if not found
-app.get('/:code', (req, res) => {
+app.get('/:code', async (req, res) => {
   const { code } = req.params;
 
   // Skip favicon or special static requests
@@ -207,15 +240,24 @@ app.get('/:code', (req, res) => {
     return res.status(404).end();
   }
 
+  await ensureDb();
   try {
-    const row = db.prepare('SELECT original_url FROM urls WHERE short_code = ?').get(code);
+    const result = await db.execute({
+      sql: 'SELECT original_url FROM urls WHERE short_code = ?',
+      args: [code]
+    });
 
-    if (!row) {
+    if (result.rows.length === 0) {
       return res.redirect('/?error=not_found');
     }
 
-    // Increment click count
-    db.prepare('UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?').run(code);
+    const row = result.rows[0];
+
+    // Increment click count (non-blocking)
+    db.execute({
+      sql: 'UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?',
+      args: [code]
+    }).catch(e => console.error('Error updating clicks:', e));
 
     // 302 redirect to original URL
     return res.redirect(302, row.original_url);
@@ -225,7 +267,11 @@ app.get('/:code', (req, res) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+// Start server if not imported by Vercel serverless environment
+if (require.main === module || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;
